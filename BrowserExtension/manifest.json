@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "Fusion 铨洲 6.8 活动报价",
+  "description": "将 Fusion 选中并导出的 STEP 交给铨洲智造 6.8 起打样页面。",
+  "version": "1.0.0",
+  "minimum_chrome_version": "102",
+  "permissions": ["storage"],
+  "host_permissions": ["http://127.0.0.1/*"],
+  "background": {"service_worker": "worker.js"},
+  "content_scripts": [
+    {"matches": ["http://127.0.0.1/qz-fusion/*"], "js": ["landing.js"]},
+    {"matches": ["https://www.gy2025.com/*", "https://gy2025.com/*"], "js": ["activity.js"]}
+  ]
+}

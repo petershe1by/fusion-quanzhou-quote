@@ -1,0 +1,14 @@
+{
+  "autodeskProduct": "Fusion360",
+  "type": "addin",
+  "id": "b91a7d5f-2351-46df-9c3a-094cd4714dd1",
+  "author": "INITIAL",
+  "description": {
+    "": "Export a single solid from Fusion and open Quanzhou's 6.8 sampling quote.",
+    "2052": "将选中的单个实体送到铨洲智造 6.8 起打样页面。"
+  },
+  "version": "1.0.0",
+  "runOnStartup": true,
+  "supportedOS": "windows",
+  "editEnabled": true
+}
