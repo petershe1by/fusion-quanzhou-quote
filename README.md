@@ -8,6 +8,8 @@
 2. 打开 Windows 版 Autodesk Fusion，按 **Shift+S**，切到 **附加模块（Add-Ins）**。点击 **+**，按界面提示选择现有附加模块并定位到 `FusionQuanzhouQuote` 文件夹。也可以把此文件夹复制进 `%APPDATA%\Autodesk\Autodesk Fusion 360\API\AddIns`，再重启 Fusion。选中 `FusionQuanzhouQuote` 后点 **运行**。需要每次启动都可用时，启用 **启动时运行**。 [Autodesk 安装说明](https://help.autodesk.com/view/fusion360/ENU/?caas=caas%2Fsfdcarticles%2Fsfdcarticles%2FHow-to-install-an-ADD-IN-and-Script-in-Fusion-360.html)
 3. 在系统默认浏览器的常用配置文件中加载 `BrowserExtension`。Edge 打开 `edge://extensions`，Chrome 打开 `chrome://extensions`。开启 **开发人员模式**，选择 **加载解压缩的扩展**，定位到包含 `manifest.json` 的 `BrowserExtension` 文件夹。 [Microsoft Edge 加载说明](https://learn.microsoft.com/en-us/microsoft-edge/extensions/getting-started/extension-sideloading)
 
+从 1.0.0 升级时，用新版 `FusionQuanzhouQuote` 文件夹中的文件覆盖原附加模块，再重启 Fusion。已加载的浏览器扩展可以继续使用。
+
 ## 使用
 
 - 可以从设计树选只含一个实体的零件组件，也可以选实体本身，或点击实体上的一个面。多实体组件或子装配请展开并明确选中一个实体。也可以从 **设计 → 实用程序 → 铨洲 6.8 活动报价** 打开命令后再选。
@@ -17,6 +19,6 @@
 
 ## 数据流
 
-Fusion 把所选实体复制到一个临时设计中并输出 STEP，然后关闭临时设计。浏览器扩展通过 `127.0.0.1` 上的临时链接领取这一个文件。官网登录使用你平时的浏览器会话，扩展使用官网自己的 STEP 上传控件。窗口中的文件交接提示仅报告浏览器这一步。
+Fusion 直接导出只含一个实体的独立零件。需要从多实体组件中单独取一件时，插件在命令结束后将所选实体复制到临时设计导出，随后关闭临时设计。浏览器扩展通过 `127.0.0.1` 上的临时链接领取这一个文件。官网登录使用你平时的浏览器会话，扩展使用官网自己的 STEP 上传控件。窗口中的文件交接提示仅报告浏览器这一步。
 
 参考了野生齿轮的 SolidWorks 宏和附件中的选件、导出及确认上传流程。Fusion 版使用 Autodesk Fusion API 和浏览器扩展实现同一流程，操作时可以继续使用鼠标和键盘。 [RoboMaster 原帖](https://bbs.robomaster.com/article/1982836?source=4)

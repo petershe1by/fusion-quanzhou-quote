@@ -1,9 +1,13 @@
+import ctypes
 import os
 import re
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
+from threading import Event, Thread
 import traceback
+from uuid import uuid4
 
 import adsk.core
 import adsk.fusion
@@ -34,6 +38,15 @@ class QuoteError(Exception):
     pass
 
 
+@dataclass
+class _ExportRequest:
+    solid: object
+    name: str
+    auto_confirm: bool
+    token: str = field(default_factory=lambda: uuid4().hex)
+    done: Event = field(default_factory=Event)
+
+
 def _describe_error(error):
     if isinstance(error, QuoteError):
         return str(error)
@@ -53,12 +66,14 @@ def _selection_types(entity):
 def _resolve_part(entity):
     occurrence, component, body, face = _selection_types(entity)
     if occurrence:
-        if occurrence.isSuppressed:
-            raise QuoteError('该组件已抑制或不可用，请选中一个可用的零件。')
+        if not occurrence.isValid:
+            raise QuoteError('所选组件实例已失效，请重新选择。')
         component = occurrence.component
         if not component:
             raise QuoteError('该组件不可用，请选中另一个零件。')
     if component:
+        if not component.isValid:
+            raise QuoteError('该组件不可用，请选中另一个零件。')
         if component.occurrences.count:
             raise QuoteError('这里选中了装配组件。请展开装配并选中一个零件或实体。')
         solids = [candidate for candidate in component.bRepBodies if candidate.isSolid]
@@ -90,6 +105,29 @@ def _export_path(name):
     return Path(mkdtemp(prefix=prefix, dir=exports)) / (stem + '.step')
 
 
+def _write_step(design, output, component=None):
+    manager = design.exportManager
+    if component is None:
+        options = manager.createSTEPExportOptions(str(output))
+    else:
+        options = manager.createSTEPExportOptions(str(output), component)
+    if not options or not manager.execute(options):
+        raise QuoteError('Fusion 的 STEP 导出失败，请检查零件几何。')
+    if not output.is_file():
+        raise QuoteError('Fusion 没有生成 STEP 文件。')
+    with output.open('rb') as exported:
+        if not exported.read(64).lstrip().startswith(b'ISO-10303-21;'):
+            raise QuoteError('导出的文件缺少有效的 STEP 文件头。')
+
+
+def _direct_component(solid):
+    component = solid.parentComponent
+    if (component and component.isValid and component.bRepBodies.count == 1
+            and component.occurrences.count == 0 and component.meshBodies.count == 0):
+        return component
+    return None
+
+
 def _export_solid(solid, output):
     # Use the native body in its component's coordinate system. The source document
     # stays open while the STEP translator works on an isolated, unsaved document.
@@ -109,13 +147,7 @@ def _export_solid(solid, output):
         if not copy or not copy.isSolid:
             raise QuoteError('Fusion 无法将所选实体写入临时设计。')
         copy.name = output.stem
-        manager = design.exportManager
-        options = manager.createSTEPExportOptions(str(output))
-        if not options or not manager.execute(options):
-            raise QuoteError('STEP 导出失败，请检查实体几何。')
-        with output.open('rb') as exported:
-            if not exported.read(64).lstrip().startswith(b'ISO-10303-21;'):
-                raise QuoteError('导出的文件缺少有效的 STEP 文件头。')
+        _write_step(design, output)
     finally:
         if not document.close(False):
             _app.log('FusionQuanzhouQuote: could not close temporary export document.')
@@ -136,29 +168,70 @@ def _open_quote(output, auto_confirm):
         _ui.messageBox(f'STEP 已导出，请在活动页手动选择此文件。\n\n{output}\n\n{ACTIVITY_URL}', TITLE)
 
 
+def _export_file(request, component=None):
+    if not request.solid.isValid:
+        raise QuoteError('原实体已不可用，请重新选择。')
+    output = _export_path(request.name)
+    try:
+        if component is None:
+            _export_solid(request.solid, output)
+        else:
+            _write_step(component.parentDesign, output, component)
+    except Exception:
+        try:
+            output.unlink(missing_ok=True)
+            output.parent.rmdir()
+        except OSError:
+            pass
+        raise
+    return output
+
+
+def _ensure_export_event():
+    global _export_event
+    if _export_event:
+        return
+    event = _app.registerCustomEvent(EXPORT_EVENT_ID)
+    if not event:
+        raise QuoteError('Fusion 无法注册隔离实体导出的事件。请重启 Fusion 后再试。')
+    exporter = _RunExport()
+    if not event.add(exporter):
+        _app.unregisterCustomEvent(EXPORT_EVENT_ID)
+        raise QuoteError('Fusion 无法连接隔离实体导出的事件。请重启 Fusion 后再试。')
+    _handlers.append(exporter)
+    _export_event = event
+
+
+def _queue_isolated_export(app, request):
+    # Only the event signal crosses threads. All modeling calls stay on Fusion's UI thread.
+    for _ in range(30):
+        if request.done.wait(0.4):
+            return
+        try:
+            app.fireCustomEvent(EXPORT_EVENT_ID, request.token)
+        except RuntimeError:
+            continue
+    if not request.done.is_set():
+        request.done.set()
+        ctypes.windll.user32.MessageBoxW(
+            None, 'Fusion 未能开始单独实体导出。关闭其他活动命令后，请重新选择实体并打开活动报价。',
+            TITLE, 0x10,
+        )
+
+
 class _RunExport(adsk.core.CustomEventHandler):
     def notify(self, args):
         global _pending_export
-        request, _pending_export = _pending_export, None
-        if request is None:
+        request = _pending_export
+        if (request is None or request.done.is_set() or request.token != args.additionalInfo
+                or _ui.activeCommand not in ('', 'SelectCommand')):
             return
-        solid, name, auto_confirm = request
-        output = None
+        request.done.set()
+        _pending_export = None
         try:
-            if not solid.isValid:
-                raise QuoteError('原实体已不可用，请重新选择。')
-            output = _export_path(name)
-            _export_solid(solid, output)
+            _open_quote(_export_file(request), request.auto_confirm)
         except Exception as error:
-            if output is not None:
-                try:
-                    output.unlink(missing_ok=True)
-                    output.parent.rmdir()
-                except OSError:
-                    pass
             _ui.messageBox(_describe_error(error), TITLE)
-            return
-        _open_quote(output, auto_confirm)
 
 
 class _Execute(adsk.core.CommandEventHandler):
@@ -172,19 +245,27 @@ class _Execute(adsk.core.CommandEventHandler):
         try:
             if self.selection.selectionCount != 1:
                 raise QuoteError('请选择一个零件。')
-            if _pending_export is not None:
+            if _pending_export is not None and not _pending_export.done.is_set():
                 raise QuoteError('上一个零件正在导出，请稍后再试。')
             solid, name = _resolve_part(self.selection.selection(0).entity)
-            _pending_export = solid, name, self.confirmation.value
-            # Fusion does not allow opening or closing designs during a command.
+            request = _ExportRequest(solid, name, self.confirmation.value)
+            component = _direct_component(solid)
+            if component is not None:
+                try:
+                    output = _export_file(request, component)
+                except (QuoteError, RuntimeError) as error:
+                    _app.log(f'FusionQuanzhouQuote: direct STEP export failed, trying an isolated body. {error}')
+                else:
+                    _open_quote(output, request.auto_confirm)
+                    return
+            # Only exports that need a temporary design wait for the command to finish.
+            _ensure_export_event()
+            _pending_export = request
             try:
-                scheduled = _app.fireCustomEvent(EXPORT_EVENT_ID)
+                Thread(target=_queue_isolated_export, args=(_app, request), daemon=True).start()
             except Exception:
                 _pending_export = None
                 raise
-            if not scheduled:
-                _pending_export = None
-                raise QuoteError('Fusion 无法安排导出，请重试。')
         except Exception as error:
             args.executeFailed = True
             args.executeFailedMessage = _describe_error(error)
@@ -259,17 +340,12 @@ class _MarkingMenu(adsk.core.MarkingMenuEventHandler):
 
 
 def run(context):
-    global _app, _ui, _export_event, _definition, _control, _menu_handler
+    global _app, _ui, _definition, _control, _menu_handler
     _app = adsk.core.Application.get()
     _ui = _app.userInterface
     if _definition is not None:
         return
     try:
-        _export_event = _app.registerCustomEvent(EXPORT_EVENT_ID)
-        exporter = _RunExport()
-        _export_event.add(exporter)
-        _handlers.append(exporter)
-
         _definition = _ui.commandDefinitions.addButtonDefinition(
             COMMAND_ID, TITLE, '将单个实体导入铨洲智造 6.8 起打样。'
         )
@@ -291,6 +367,8 @@ def run(context):
 
 def stop(context):
     global _bridge, _export_event, _definition, _control, _menu_handler, _pending_export
+    if _pending_export is not None:
+        _pending_export.done.set()
     _pending_export = None
     if _bridge:
         _bridge.close()
