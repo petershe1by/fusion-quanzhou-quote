@@ -1,22 +1,27 @@
 import ctypes
+import csv
 import json
 import os
 import re
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from tempfile import mkdtemp
-from threading import Event, Thread
+from threading import Event, Lock, Thread
+from time import monotonic
 import traceback
 from uuid import uuid4
 
 import adsk.core
 import adsk.fusion
 
-from .quote_bridge import ACTIVITY_URL, QuoteBridge
+from .quote_bridge import ACTIVITY_URL, MAX_FILES, QuoteBridge
 
 
 COMMAND_ID = 'Initial_FusionQuanzhouQuote'
+QUICK_ID = COMMAND_ID + '_Quick'
+QUICK_MENU_ID = COMMAND_ID + '_QuickMenu'
 EXPORT_EVENT_ID = COMMAND_ID + '_Export'
 PANEL_ID = 'SolidScriptsAddinsPanel'
 TITLE = '铨洲 6.8 活动报价'
@@ -34,9 +39,17 @@ _bridge = None
 _export_event = None
 _definition = None
 _control = None
+_quick_definition = None
+_quick_menu_definition = None
+_quick_control = None
+_quick_start_handler = None
+_toolbar_selection = None
+_menu_selection = ()
 _menu_handler = None
 _handlers = []
 _pending_export = None
+_browser_launch_lock = Lock()
+_last_browser_launch = -float('inf')
 
 
 class QuoteError(Exception):
@@ -45,10 +58,10 @@ class QuoteError(Exception):
 
 @dataclass
 class _ExportRequest:
-    solid: object
-    name: str
+    directory: Path
     auto_confirm: bool
-    folder: Path
+    files: list = field(default_factory=list)
+    remaining: list = field(default_factory=list)
     token: str = field(default_factory=lambda: uuid4().hex)
     done: Event = field(default_factory=Event)
 
@@ -146,16 +159,20 @@ def _save_export_folder(folder):
         temporary.unlink(missing_ok=True)
 
 
-def _export_path(name, folder):
+def _file_stem(name):
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:90].rstrip(' .')
     if not stem:
         stem = 'Part'
     if re.fullmatch(r'CON|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³]', stem.split('.')[0], re.I):
         stem = '_' + stem
+    return stem
+
+
+def _batch_directory(folder):
     prefix = datetime.now().strftime('%Y%m%d-%H%M%S-')
     try:
         folder.mkdir(parents=True, exist_ok=True)
-        return Path(mkdtemp(prefix=prefix, dir=folder)) / (stem + '.step')
+        return Path(mkdtemp(prefix=prefix, dir=folder))
     except OSError as error:
         raise OSError(f'无法在当前保存位置创建 STEP 导出文件夹。请在报价窗口选择其他文件夹。\n{folder}\n{error}') from error
 
@@ -208,38 +225,46 @@ def _export_solid(solid, output):
             _app.log('FusionQuanzhouQuote: could not close temporary export document.')
 
 
-def _open_quote(output, auto_confirm):
+def _browser_running():
+    tasklist = Path(os.environ.get('SystemRoot', r'C:\Windows')) / 'System32' / 'tasklist.exe'
+    try:
+        result = subprocess.run([str(tasklist), '/FO', 'CSV', '/NH'], capture_output=True,
+                                check=True, text=True, errors='replace', timeout=5,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+    except (OSError, subprocess.SubprocessError):
+        return True
+    return any(row and row[0].lower() in {'msedge.exe', 'chrome.exe'}
+               for row in csv.reader(result.stdout.splitlines()))
+
+
+def _watch_browser(bridge, received, directory):
+    global _last_browser_launch
+    if received.wait(1.5) or bridge.closed:
+        return
+    with _browser_launch_lock:
+        if monotonic() - _last_browser_launch >= 15 and not _browser_running():
+            if not received.is_set() and not bridge.closed:
+                _last_browser_launch = monotonic()
+                try:
+                    os.startfile(ACTIVITY_URL)
+                except OSError:
+                    pass
+    if not received.wait(40) and not bridge.closed:
+        ctypes.windll.user32.MessageBoxW(
+            None, '这批 STEP 已保存。尚未收到浏览器扩展的响应，请检查 Edge 或 Chrome 中已启用新版扩展。\n\n'
+            + str(directory), TITLE, 0x30,
+        )
+
+
+def _publish_batch(request):
     global _bridge
     try:
         if _bridge is None:
             _bridge = QuoteBridge()
-        os.startfile(_bridge.add(output, auto_confirm))
-    except OSError as error:
-        _app.log(str(error))
-        try:
-            os.startfile(ACTIVITY_URL)
-        except OSError:
-            _app.log('FusionQuanzhouQuote: could not open default browser.')
-        _ui.messageBox(f'STEP 已导出，请在活动页手动选择此文件。\n\n{output}\n\n{ACTIVITY_URL}', TITLE)
-
-
-def _export_file(request, component=None):
-    if not request.solid.isValid:
-        raise QuoteError('原实体已不可用，请重新选择。')
-    output = _export_path(request.name, request.folder)
-    try:
-        if component is None:
-            _export_solid(request.solid, output)
-        else:
-            _write_step(component.parentDesign, output, component)
-    except Exception:
-        try:
-            output.unlink(missing_ok=True)
-            output.parent.rmdir()
-        except OSError:
-            pass
-        raise
-    return output
+        received = _bridge.add(request.files, request.auto_confirm)
+    except (OSError, ValueError) as error:
+        raise QuoteError(f'这批 STEP 已保存，浏览器交接失败。\n{request.directory}\n{error}') from error
+    Thread(target=_watch_browser, args=(_bridge, received, request.directory), daemon=True).start()
 
 
 def _ensure_export_event():
@@ -269,7 +294,7 @@ def _queue_isolated_export(app, request):
     if not request.done.is_set():
         request.done.set()
         ctypes.windll.user32.MessageBoxW(
-            None, 'Fusion 未能开始单独实体导出。关闭其他活动命令后，请重新选择实体并打开活动报价。',
+            None, 'Fusion 未能开始隔离实体导出。请结束其他活动命令后重新报价。\n\n' + str(request.directory),
             TITLE, 0x10,
         )
 
@@ -284,59 +309,96 @@ class _RunExport(adsk.core.CustomEventHandler):
         request.done.set()
         _pending_export = None
         try:
-            _open_quote(_export_file(request), request.auto_confirm)
+            for solid, output in request.remaining:
+                if not solid.isValid:
+                    raise QuoteError(f'实体已不可用。请重新选择零件。\n{output.name}')
+                try:
+                    _export_solid(solid, output)
+                except Exception:
+                    output.unlink(missing_ok=True)
+                    raise
+            _publish_batch(request)
         except Exception as error:
-            _ui.messageBox(_describe_error(error), TITLE)
+            _ui.messageBox(f'{_describe_error(error)}\n\n导出目录：{request.directory}', TITLE)
+
+
+def _start_batch(entities, auto_confirm, folder):
+    global _pending_export
+    if not 1 <= len(entities) <= MAX_FILES:
+        raise QuoteError(f'请选择 1 至 {MAX_FILES} 个零件、实体或实体面。')
+    if _pending_export is not None and not _pending_export.done.is_set():
+        raise QuoteError('上一批零件正在导出，请稍后再试。')
+
+    parts = []
+    names = set()
+    for entity in entities:
+        solid, name = _resolve_part(entity)
+        if not solid.isValid:
+            raise QuoteError(f'零件已不可用，请重新选择。\n{name}')
+        if any(solid == part[0] for part in parts):
+            continue
+        stem = _file_stem(name)
+        unique = stem
+        suffix = 2
+        while unique.casefold() in names:
+            unique = f'{stem} ({suffix})'
+            suffix += 1
+        names.add(unique.casefold())
+        parts.append((solid, unique + '.step'))
+
+    request = _ExportRequest(_batch_directory(folder), auto_confirm)
+    for solid, filename in parts:
+        output = request.directory / filename
+        request.files.append(output)
+        component = _direct_component(solid)
+        if component is not None:
+            try:
+                _write_step(component.parentDesign, output, component)
+            except (QuoteError, RuntimeError) as error:
+                output.unlink(missing_ok=True)
+                _app.log(f'FusionQuanzhouQuote: direct STEP export failed for {filename}; trying isolated export. {error}')
+            else:
+                continue
+        request.remaining.append((solid, output))
+
+    if not request.remaining:
+        _publish_batch(request)
+        return
+    # Only exports that need a temporary design wait for the command to finish.
+    _ensure_export_event()
+    _pending_export = request
+    try:
+        Thread(target=_queue_isolated_export, args=(_app, request), daemon=True).start()
+    except Exception:
+        _pending_export = None
+        raise
 
 
 class _Execute(adsk.core.CommandEventHandler):
-    def __init__(self, selection, confirmation, folder):
+    def __init__(self, get_options):
         super().__init__()
-        self.selection = selection
-        self.confirmation = confirmation
-        self.folder = folder
+        self.get_options = get_options
 
     def notify(self, args):
-        global _pending_export
         try:
-            if self.selection.selectionCount != 1:
-                raise QuoteError('请选择一个零件。')
-            if _pending_export is not None and not _pending_export.done.is_set():
-                raise QuoteError('上一个零件正在导出，请稍后再试。')
-            solid, name = _resolve_part(self.selection.selection(0).entity)
-            request = _ExportRequest(solid, name, self.confirmation.value, Path(self.folder.value))
-            component = _direct_component(solid)
-            if component is not None:
-                try:
-                    output = _export_file(request, component)
-                except (QuoteError, RuntimeError) as error:
-                    _app.log(f'FusionQuanzhouQuote: direct STEP export failed, trying an isolated body. {error}')
-                else:
-                    _open_quote(output, request.auto_confirm)
-                    return
-            # Only exports that need a temporary design wait for the command to finish.
-            _ensure_export_event()
-            _pending_export = request
-            try:
-                Thread(target=_queue_isolated_export, args=(_app, request), daemon=True).start()
-            except Exception:
-                _pending_export = None
-                raise
+            _start_batch(*self.get_options())
         except Exception as error:
             args.executeFailed = True
             args.executeFailedMessage = _describe_error(error)
 
 
 class _Prefill(adsk.core.CommandEventHandler):
-    def __init__(self, selection, entity):
+    def __init__(self, selection, entities):
         super().__init__()
         self.selection = selection
-        self.entity = entity
+        self.entities = entities
 
     def notify(self, args):
-        entity, self.entity = self.entity, None
-        if entity and entity.isValid and self.selection.selectionCount == 0:
-            self.selection.addSelection(entity)
+        entities, self.entities = self.entities, []
+        if self.selection.selectionCount == 0:
+            for entity in entities:
+                if entity.isValid and any(_selection_types(entity)):
+                    self.selection.addSelection(entity)
 
 
 class _FolderActions(adsk.core.InputChangedEventHandler):
@@ -386,22 +448,26 @@ class _Release(adsk.core.CommandEventHandler):
         self.handlers.clear()
 
 
+def _picked_entities():
+    selected = _ui.activeSelections
+    if selected.count:
+        return [selected.item(index).entity for index in range(selected.count)]
+    entity = _standalone_body()
+    return [entity] if entity else []
+
+
 class _CreateCommand(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
-            selected = _ui.activeSelections
-            selection_count = selected.count
-            entity = selected.item(0).entity if selection_count == 1 else None
-            if selection_count == 0:
-                entity = _standalone_body()
+            entities = _picked_entities()
             command = args.command
             command.okButtonText = '打开活动报价'
             command.isRepeatable = False
             inputs = command.commandInputs
-            selection = inputs.addSelectionInput(SELECTION_ID, '零件', '请选择一件组件、实体或实体面')
+            selection = inputs.addSelectionInput(SELECTION_ID, '零件', '可多选零件组件、实体或实体面')
             for selection_filter in FILTERS:
                 selection.addSelectionFilter(selection_filter)
-            selection.setSelectionLimits(1, 1)
+            selection.setSelectionLimits(1, MAX_FILES)
             confirmation = inputs.addBoolValueInput(AUTO_ID, '自动确认 6061 报价', True, '', True)
             confirmation.tooltip = '使用官网默认的铝合金 6061。取消勾选可在官网先选材质。'
             folder = inputs.addStringValueInput(FOLDER_ID, 'STEP 保存位置', str(_load_export_folder()))
@@ -414,17 +480,22 @@ class _CreateCommand(adsk.core.CommandCreatedEventHandler):
             actions.listItems.add(BROWSE_FOLDER, False)
             actions.listItems.add(RESET_FOLDER, False)
             note = inputs.addTextBoxCommandInput(
-                'quanzhou_help', '', '独立零件会自动选中唯一实体。装配中请选择要报价的那一件。', 2, True
+                'quanzhou_help', '', '可一次报价多个零件。独立零件会自动选中唯一实体。', 2, True
             )
             note.isFullWidth = True
             folder_actions = _FolderActions(actions, folder)
             command.inputChanged.add(folder_actions)
             handlers = [folder_actions]
-            if entity and any(_selection_types(entity)):
-                prefill = _Prefill(selection, entity)
+            if entities and len(entities) <= MAX_FILES:
+                prefill = _Prefill(selection, entities)
                 command.activate.add(prefill)
                 handlers.append(prefill)
-            execute = _Execute(selection, confirmation, folder)
+
+            def get_options():
+                selected = [selection.selection(index).entity for index in range(selection.selectionCount)]
+                return selected, confirmation.value, Path(folder.value)
+
+            execute = _Execute(get_options)
             release = _Release(handlers)
             command.execute.add(execute)
             command.destroy.add(release)
@@ -434,36 +505,91 @@ class _CreateCommand(adsk.core.CommandCreatedEventHandler):
             _ui.messageBox(_describe_error(error), TITLE)
 
 
+class _QuickCommand(adsk.core.CommandCreatedEventHandler):
+    def __init__(self, from_menu=False):
+        super().__init__()
+        self.from_menu = from_menu
+
+    def notify(self, args):
+        global _toolbar_selection, _menu_selection
+        try:
+            command = args.command
+            command.isRepeatable = False
+            if self.from_menu:
+                selected, _menu_selection = _menu_selection, ()
+            else:
+                selected, _toolbar_selection = _toolbar_selection, None
+                if selected is None:
+                    selected = _picked_entities()
+            execute = _Execute(lambda: (selected, True, _load_export_folder()))
+            handlers = [execute]
+            release = _Release(handlers)
+            handlers.append(release)
+            command.execute.add(execute)
+            command.destroy.add(release)
+            _handlers.extend(handlers)
+        except Exception as error:
+            _ui.messageBox(_describe_error(error), TITLE)
+
+
+class _CaptureQuickSelection(adsk.core.ApplicationCommandEventHandler):
+    def notify(self, args):
+        global _toolbar_selection
+        if args.commandId == QUICK_ID:
+            _toolbar_selection = _picked_entities()
+
+
 class _MarkingMenu(adsk.core.MarkingMenuEventHandler):
     def notify(self, args):
+        global _menu_selection
         try:
+            _menu_selection = ()
             entities = args.selectedEntities
-            if len(entities) == 1 and any(_selection_types(entities[0])):
+            if 1 <= len(entities) <= MAX_FILES and all(any(_selection_types(entity)) for entity in entities):
+                _menu_selection = tuple(entities)
+                args.linearMarkingMenu.controls.addCommand(_quick_menu_definition)
                 args.linearMarkingMenu.controls.addCommand(_definition)
         except Exception:
             _app.log(traceback.format_exc())
 
 
 def run(context):
-    global _app, _ui, _definition, _control, _menu_handler
+    global _app, _ui, _definition, _control, _quick_definition, _quick_menu_definition
+    global _quick_control, _quick_start_handler, _menu_handler, _bridge
     _app = adsk.core.Application.get()
     _ui = _app.userInterface
     if _definition is not None:
         return
     try:
         _definition = _ui.commandDefinitions.addButtonDefinition(
-            COMMAND_ID, TITLE, '将单个实体导入铨洲智造 6.8 起打样。'
+            COMMAND_ID, TITLE, '设置保存位置、选择零件或修改铨洲 6.8 活动报价方式。'
         )
         creator = _CreateCommand()
         _definition.commandCreated.add(creator)
         _handlers.append(creator)
+        title = '铨洲一键报价'
+        tooltip = '导出所选零件，使用 6061 自动确认铨洲 6.8 活动报价。'
+        _quick_definition = _ui.commandDefinitions.addButtonDefinition(QUICK_ID, title, tooltip)
+        _quick_menu_definition = _ui.commandDefinitions.addButtonDefinition(QUICK_MENU_ID, title, tooltip)
+        for definition, from_menu in ((_quick_definition, False), (_quick_menu_definition, True)):
+            quick = _QuickCommand(from_menu)
+            definition.commandCreated.add(quick)
+            _handlers.append(quick)
+        _quick_start_handler = _CaptureQuickSelection()
+        _ui.commandStarting.add(_quick_start_handler)
 
         panel = _ui.allToolbarPanels.itemById(PANEL_ID)
         if panel:
             _control = panel.controls.addCommand(_definition)
             _control.isPromoted = True
+            _quick_control = panel.controls.addCommand(_quick_definition)
+            _quick_control.isPromoted = True
         _menu_handler = _MarkingMenu()
         _ui.markingMenuDisplaying.add(_menu_handler)
+        try:
+            _bridge = QuoteBridge()
+        except OSError as error:
+            _app.log(f'FusionQuanzhouQuote: cannot listen on loopback yet: {error}')
     except Exception as error:
         message = _describe_error(error)
         stop(context)
@@ -471,7 +597,10 @@ def run(context):
 
 
 def stop(context):
-    global _bridge, _export_event, _definition, _control, _menu_handler, _pending_export
+    global _bridge, _export_event, _definition, _control, _quick_definition, _quick_menu_definition
+    global _quick_control, _quick_start_handler, _menu_handler, _pending_export, _toolbar_selection, _menu_selection
+    _toolbar_selection = None
+    _menu_selection = ()
     if _pending_export is not None:
         _pending_export.done.set()
     _pending_export = None
@@ -481,12 +610,24 @@ def stop(context):
     if _menu_handler:
         _ui.markingMenuDisplaying.remove(_menu_handler)
         _menu_handler = None
+    if _quick_start_handler:
+        _ui.commandStarting.remove(_quick_start_handler)
+        _quick_start_handler = None
     if _control:
         _control.deleteMe()
         _control = None
+    if _quick_control:
+        _quick_control.deleteMe()
+        _quick_control = None
     if _definition:
         _definition.deleteMe()
         _definition = None
+    if _quick_definition:
+        _quick_definition.deleteMe()
+        _quick_definition = None
+    if _quick_menu_definition:
+        _quick_menu_definition.deleteMe()
+        _quick_menu_definition = None
     if _export_event:
         _app.unregisterCustomEvent(EXPORT_EVENT_ID)
         _export_event = None

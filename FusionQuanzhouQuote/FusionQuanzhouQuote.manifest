@@ -4,10 +4,10 @@
   "id": "b91a7d5f-2351-46df-9c3a-094cd4714dd1",
   "author": "INITIAL",
   "description": {
-    "": "Export a single solid from Fusion and open Quanzhou's 6.8 sampling quote.",
-    "2052": "将选中的单个实体送到铨洲智造 6.8 起打样页面。"
+    "": "Send selected Fusion solids to Quanzhou's 6.8 sampling quote as a batch.",
+    "2052": "将选中的多个实体批量送到铨洲智造 6.8 起打样页面。"
   },
-  "version": "1.0.3",
+  "version": "1.1.0",
   "runOnStartup": true,
   "supportedOS": "windows",
   "editEnabled": true

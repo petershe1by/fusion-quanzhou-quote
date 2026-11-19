@@ -1,17 +1,62 @@
 const activityUrl = 'https://www.gy2025.com/#/home/proofing';
+const activityHash = '#/home/proofing';
 const officialOrigins = new Set(['https://www.gy2025.com', 'https://gy2025.com']);
-const bridgePath = /^\/qz-fusion\/[A-Za-z0-9_-]{32}$/;
+const tabPatterns = ['https://www.gy2025.com/*', 'https://gy2025.com/*'];
+const bridgeUrl = 'http://127.0.0.1:49167/qz-batch';
+const alarmName = 'quanzhou-check-bridge';
 const maxBytes = 7 * 1024 * 1024;
-const activeClaims = new Set();
+let clientPromise;
+let polling = false;
+let wakeRequested = false;
+let finishing = false;
 
-function bridgeRequest(bridge, endpoint) {
-  return fetch(`${bridge}/${endpoint}`, {
-    headers: { 'X-Fusion-Bridge': '1' },
-    redirect: 'error',
-    credentials: 'omit',
-    cache: 'no-store',
-    signal: AbortSignal.timeout(8000),
+function siteUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return officialOrigins.has(parsed.origin) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+function isActivity(url) {
+  return siteUrl(url)?.hash.split('?')[0] === activityHash;
+}
+
+function getClientId() {
+  if (!clientPromise) {
+    clientPromise = (async () => {
+      const saved = (await chrome.storage.session.get('clientId')).clientId;
+      if (saved) return saved;
+      const clientId = crypto.randomUUID();
+      await chrome.storage.session.set({ clientId });
+      return clientId;
+    })();
+    clientPromise.catch(() => { clientPromise = undefined; });
+  }
+  return clientPromise;
+}
+
+async function bridgeRequest(endpoint, data = {}) {
+  return fetch(`${bridgeUrl}/${endpoint}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'X-Fusion-Bridge': '2' },
+    body: JSON.stringify({ client: await getClientId(), ...data }),
+    redirect: 'error', credentials: 'omit', cache: 'no-store',
+    signal: AbortSignal.timeout(22000),
   });
+}
+
+function validJob(job) {
+  if (!/^[A-Za-z0-9_-]{32}$/.test(job?.id || '') || !Number.isFinite(job.expires) ||
+      job.expires <= Date.now() || !Array.isArray(job.files) || job.files.length < 1 || job.files.length > 100) return false;
+  const names = new Set();
+  for (const file of job.files) {
+    if (typeof file?.name !== 'string' || !/^[^/\\]+\.step$/i.test(file.name) ||
+        !Number.isInteger(file.size) || file.size < 1 || file.size > maxBytes || names.has(file.name.toLowerCase())) return false;
+    names.add(file.name.toLowerCase());
+  }
+  return true;
 }
 
 function encodeFile(bytes) {
@@ -22,88 +67,147 @@ function encodeFile(bytes) {
   return btoa(binary);
 }
 
-async function start(url, tabId, key) {
-  if (url.protocol !== 'http:' || url.hostname !== '127.0.0.1' || !url.port ||
-      !bridgePath.test(url.pathname) || url.search || url.hash) return {};
-  const bridge = `${url.origin}${url.pathname}`;
-  const response = await bridgeRequest(bridge, 'info');
-  if (!response.ok) return { error: 'Fusion 的文件交接已过期，请重新发起。' };
-
-  const info = await response.json();
-  if (info.activity !== activityUrl || typeof info.filename !== 'string' ||
-      !/\.step$/i.test(info.filename) || !Number.isInteger(info.size) ||
-      info.size <= 0 || !Number.isFinite(info.expires) || info.expires <= Date.now()) {
-    return { error: '无法识别这次 STEP 导出，请手动上传。' };
-  }
-  if (info.claimed) return { error: '这个 STEP 已交接过一次，可以在活动页检查结果。' };
-  if (info.size > maxBytes) return { error: '文件超出了活动页的 7 MiB STEP 上限。' };
-
-  const job = {
-    bridge, filename: info.filename, size: info.size, expires: info.expires,
-    claimed: false, autoConfirm: info.autoConfirm === true,
-  };
-  await chrome.storage.session.set({ [key]: job });
+async function pushJob(tabId, job) {
+  const message = { type: 'job', job };
   try {
-    await chrome.tabs.update(tabId, { url: activityUrl });
-  } catch (error) {
-    await chrome.storage.session.remove(key);
-    throw error;
+    await chrome.tabs.sendMessage(tabId, message);
+    return;
+  } catch {
+    // An already-open page can predate the extension reload.
   }
-  return {};
+  try {
+    const tab = await chrome.tabs.get(tabId);
+    if (!isActivity(tab.pendingUrl || tab.url) || tab.status === 'loading') return;
+    await chrome.scripting.executeScript({ target: { tabId }, files: ['activity.js'] });
+    await chrome.tabs.sendMessage(tabId, message);
+  } catch {
+    // A navigation can race with injection. The installed content script announces readiness.
+  }
 }
 
-async function claim(job, key) {
-  if (job.claimed || activeClaims.has(key)) return { error: '这个 STEP 已开始交接，请检查官网或手动上传。' };
-  if (Date.now() >= job.expires) return { error: '自动交接已过期。请从 Fusion 重新发起。' };
-
-  activeClaims.add(key);
-  try {
-    const response = await bridgeRequest(job.bridge, 'step');
-    if (!response.ok) return { error: '无法从 Fusion 读取此 STEP，可以改用手动上传。' };
-    if (Number(response.headers.get('Content-Length')) !== job.size) {
-      return { error: 'STEP 文件长度不匹配，可以改用手动上传。' };
-    }
-    const bytes = new Uint8Array(await response.arrayBuffer());
-    if (bytes.length !== job.size) return { error: 'STEP 文件接收不完整，可以改用手动上传。' };
-    await chrome.storage.session.set({ [key]: { ...job, claimed: true } });
-    return { filename: job.filename, base64: encodeFile(bytes) };
-  } finally {
-    activeClaims.delete(key);
+async function openActivity(job) {
+  const tabs = await chrome.tabs.query({ url: tabPatterns });
+  tabs.sort((a, b) => Number(b.active) - Number(a.active) || (b.lastAccessed || 0) - (a.lastAccessed || 0));
+  let tab = tabs.find(candidate => isActivity(candidate.pendingUrl || candidate.url)) || tabs[0];
+  if (tab) {
+    await chrome.storage.session.set({ current: { job, tabId: tab.id } });
+    const url = tab.pendingUrl || tab.url;
+    tab = await chrome.tabs.update(tab.id, isActivity(url) ? { active: true } : { active: true, url: activityUrl });
+  } else {
+    tab = await chrome.tabs.create({ url: activityUrl, active: true });
+    await chrome.storage.session.set({ current: { job, tabId: tab.id } });
   }
+  await chrome.windows.update(tab.windowId, { focused: true }).catch(() => {});
+  await pushJob(tab.id, job);
+}
+
+async function finishCurrent(current) {
+  if (finishing) return;
+  finishing = true;
+  try {
+    // Remember the terminal state until the bridge has acknowledged it.
+    await chrome.storage.session.set({ current: { ...current, finished: true } });
+    const response = await bridgeRequest('finish', { id: current.job.id });
+    if (response.ok || response.status === 404) await chrome.storage.session.remove('current');
+  } catch {
+    // Retry from the persisted terminal state when the worker next wakes.
+  } finally {
+    finishing = false;
+  }
+}
+
+async function poll() {
+  let { current } = await chrome.storage.session.get('current');
+  if (current) {
+    if (current.finished || current.job.expires <= Date.now() ||
+        (current.armed && current.armed < Date.now() - 45000)) {
+      await finishCurrent(current);
+    } else if (!current.armed) {
+      const tab = await chrome.tabs.get(current.tabId).catch(() => null);
+      if (!tab) await finishCurrent(current);
+      else if (isActivity(tab.pendingUrl || tab.url)) await pushJob(current.tabId, current.job);
+    }
+    ({ current } = await chrome.storage.session.get('current'));
+    if (current) return;
+  }
+
+  while (true) {
+    const response = await bridgeRequest('next');
+    if (response.status === 204) {
+      // The local wait is shorter than the MV3 idle interval. An extension API call
+      // between waits resets that interval while Fusion is connected.
+      await chrome.storage.session.get('clientId');
+      continue;
+    }
+    if (!response.ok) return;
+    const job = await response.json();
+    if (!validJob(job)) return;
+    await openActivity(job);
+    return;
+  }
+}
+
+function wake() {
+  if (polling) {
+    wakeRequested = true;
+    return;
+  }
+  polling = true;
+  poll().catch(() => {}).finally(() => {
+    polling = false;
+    if (!wakeRequested) return;
+    wakeRequested = false;
+    wake();
+  });
 }
 
 async function handle(message, sender) {
-  if (sender.frameId !== 0 || !Number.isInteger(sender.tab?.id) || !sender.url) return {};
-  const tabId = sender.tab.id;
-  const key = `quote-${tabId}`;
-  const url = new URL(sender.url);
-  if (message.type === 'start') return start(url, tabId, key);
-  if (!officialOrigins.has(url.origin)) return {};
-
-  const job = (await chrome.storage.session.get(key))[key];
-  if (!job) return {};
-  if (message.type === 'read') {
-    return { job: {
-      filename: job.filename, expires: job.expires, claimed: job.claimed,
-      manual: job.manual, autoConfirm: job.autoConfirm,
-    } };
-  }
-  if (message.type === 'fallback') {
-    await chrome.storage.session.set({ [key]: { ...job, manual: true } });
-    await chrome.tabs.create({ url: `${job.bridge}#manual` });
+  const tabId = sender.tab?.id;
+  if (!Number.isInteger(tabId) || sender.frameId !== 0 || !siteUrl(sender.url)) return {};
+  const { current } = await chrome.storage.session.get('current');
+  if (message.type === 'ready') {
+    wake();
+    if (current?.tabId === tabId && !current.armed && !current.finished) return { job: current.job };
     return {};
   }
-  if (message.type === 'claim' && !job.manual && url.hash.split('?')[0] === '#/home/proofing') return claim(job, key);
-  return {};
+  if (current?.tabId !== tabId || current.job.id !== message.id || current.finished) return {};
+  if (message.type === 'finish') {
+    await finishCurrent(current);
+    wake();
+    return {};
+  }
+  if (current.armed || !isActivity((await chrome.tabs.get(tabId)).url) || current.job.expires <= Date.now()) return {};
+  if (message.type === 'arm') {
+    await chrome.storage.session.set({ current: { ...current, armed: Date.now() } });
+    return { ok: true };
+  }
+  if (message.type !== 'file' || !Number.isInteger(message.index)) return {};
+  const file = current.job.files[message.index];
+  if (!file) return {};
+  const response = await bridgeRequest('file', { id: current.job.id, index: message.index });
+  if (!response.ok || Number(response.headers.get('Content-Length')) !== file.size) {
+    return { error: `无法读取 ${file.name}，请重新发起这批报价。` };
+  }
+  const bytes = new Uint8Array(await response.arrayBuffer());
+  if (bytes.length !== file.size) return { error: `文件 ${file.name} 传输不完整。` };
+  return { base64: encodeFile(bytes) };
+}
+
+async function installAlarm() {
+  if (!await chrome.alarms.get(alarmName)) await chrome.alarms.create(alarmName, { periodInMinutes: 0.5 });
+  wake();
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
-  handle(message, sender).then(sendResponse).catch(() => {
-    sendResponse({ error: 'Fusion 文件交接失败，可以改用手动上传。' });
-  });
+  handle(message, sender).then(sendResponse).catch(() => sendResponse({ error: 'Fusion 文件交接失败。' }));
   return true;
 });
-
+chrome.runtime.onInstalled.addListener(() => { installAlarm().catch(() => {}); });
+chrome.runtime.onStartup.addListener(() => { installAlarm().catch(() => {}); });
+chrome.alarms.onAlarm.addListener(alarm => { if (alarm.name === alarmName) wake(); });
 chrome.tabs.onRemoved.addListener(tabId => {
-  chrome.storage.session.remove(`quote-${tabId}`).catch(() => {});
+  chrome.storage.session.get('current').then(async ({ current }) => {
+    if (current?.tabId === tabId) await finishCurrent(current);
+    wake();
+  }).catch(() => {});
 });
