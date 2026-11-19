@@ -2,6 +2,8 @@
 
 在 Fusion 中选中一个或多个零件，点 **铨洲一键报价**。插件批量导出 STEP，浏览器扩展把这一批传给铨洲智造的 **6.8 起打样**并以官网默认的铝合金 6061 确认上传。已有铨洲标签页时，复用其中的活动页或用现有铨洲标签页打开活动入口。 [铨洲 6.8 起打样](https://www.gy2025.com/#/home/proofing)
 
+[下载最新版本](https://github.com/petershe1by/fusion-quanzhou-quote/releases/latest) · [历史版本](CHANGELOG.md)
+
 ## 安装一次
 
 1. 先解压 ZIP 到准备长期保留的位置。里面有 `FusionQuanzhouQuote` 和 `BrowserExtension` 两个文件夹。
@@ -22,4 +24,12 @@
 
 Fusion 直接导出单实体组件。需要从多实体组件中取出一个实体时，插件在命令结束后将它复制到临时设计导出，随后关闭临时设计。扩展从 `127.0.0.1:49167` 领取主动提交的这批文件，使用当前浏览器的登录状态和官网自己的上传控件。Fusion 和浏览器扩展都需更新为 1.1.0，已选保存目录会保留。
 
-参考了野生齿轮的 SolidWorks 宏和附件中的选件、导出及确认上传流程。Fusion 版使用 Autodesk Fusion API 和浏览器扩展实现同一流程，操作时可以继续使用鼠标和键盘。 [RoboMaster 原帖](https://bbs.robomaster.com/article/1982836?source=4)
+## 验证范围
+
+已做本地批量文件交接和模拟回归，覆盖 Fusion 选件、同名 STEP、网页上传确认和标签页复用。实际 Fusion 导出至已登录铨洲账号并获得报价的整条链路仍待实机验证。
+
+## 灵感与许可
+
+灵感来自 RoboMaster 社区「野生齿轮」分享的 SolidWorks 宏《【机械小玩意】sw插件开源：一键出图至铨洲智造》。该项目展示了在 CAD 里选件后直接送去活动报价的工作流。本仓库是基于 Autodesk Fusion API 和 Edge／Chrome 扩展独立实现的 Fusion 版本。 [野生齿轮的原帖](https://bbs.robomaster.com/article/1982836?source=4)
+
+本仓库的 Fusion 版源码采用 [MIT 许可](LICENSE)。
