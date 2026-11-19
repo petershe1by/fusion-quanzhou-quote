@@ -7,7 +7,7 @@
     "": "Export a single solid from Fusion and open Quanzhou's 6.8 sampling quote.",
     "2052": "将选中的单个实体送到铨洲智造 6.8 起打样页面。"
   },
-  "version": "1.0.1",
+  "version": "1.0.2",
   "runOnStartup": true,
   "supportedOS": "windows",
   "editEnabled": true

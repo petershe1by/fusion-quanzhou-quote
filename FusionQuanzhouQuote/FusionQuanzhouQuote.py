@@ -63,6 +63,21 @@ def _selection_types(entity):
     )
 
 
+def _single_solid(component):
+    solids = [body for body in component.bRepBodies if body.isSolid]
+    return solids[0] if len(solids) == 1 else None
+
+
+def _standalone_body():
+    design = adsk.fusion.Design.cast(_app.activeProduct)
+    if not design or not design.isValid:
+        return None
+    root = design.rootComponent
+    if not root or not root.isValid or root.occurrences.count:
+        return None
+    return _single_solid(root)
+
+
 def _resolve_part(entity):
     occurrence, component, body, face = _selection_types(entity)
     if occurrence:
@@ -74,12 +89,12 @@ def _resolve_part(entity):
     if component:
         if not component.isValid:
             raise QuoteError('该组件不可用，请选中另一个零件。')
-        if component.occurrences.count:
-            raise QuoteError('这里选中了装配组件。请展开装配并选中一个零件或实体。')
-        solids = [candidate for candidate in component.bRepBodies if candidate.isSolid]
-        if len(solids) != 1:
-            raise QuoteError('所选组件需要恰好有一个实体。多实体零件请在实体文件夹中点选一个实体。')
-        return solids[0], component.name
+        if component.occurrences.count or (occurrence and occurrence.childOccurrences.count):
+            raise QuoteError('请展开装配，选中要报价的零件组件，或选中它的实体。')
+        solid = _single_solid(component)
+        if solid is None:
+            raise QuoteError('请选择含一个实体的组件，或展开实体文件夹选中要报价的实体。')
+        return solid, component.name
     if face:
         body = face.body
     if not body or not body.isSolid:
@@ -299,7 +314,10 @@ class _CreateCommand(adsk.core.CommandCreatedEventHandler):
     def notify(self, args):
         try:
             selected = _ui.activeSelections
-            entity = selected.item(0).entity if selected.count == 1 else None
+            selection_count = selected.count
+            entity = selected.item(0).entity if selection_count == 1 else None
+            if selection_count == 0:
+                entity = _standalone_body()
             command = args.command
             command.okButtonText = '打开活动报价'
             command.isRepeatable = False
@@ -311,7 +329,7 @@ class _CreateCommand(adsk.core.CommandCreatedEventHandler):
             confirmation = inputs.addBoolValueInput(AUTO_ID, '自动确认 6061 报价', True, '', True)
             confirmation.tooltip = '使用官网默认的铝合金 6061。取消勾选可在官网先选材质。'
             note = inputs.addTextBoxCommandInput(
-                'quanzhou_help', '', '导出所选实体，并在铨洲 6.8 起打样页上传和查看报价。', 2, True
+                'quanzhou_help', '', '独立零件会自动选中唯一实体。装配中请选择要报价的那一件。', 2, True
             )
             note.isFullWidth = True
             handlers = []
