@@ -1,4 +1,5 @@
 import ctypes
+import json
 import os
 import re
 from dataclasses import dataclass, field
@@ -21,6 +22,10 @@ PANEL_ID = 'SolidScriptsAddinsPanel'
 TITLE = '铨洲 6.8 活动报价'
 SELECTION_ID = 'quanzhou_part'
 AUTO_ID = 'quanzhou_confirm_6061'
+FOLDER_ID = 'quanzhou_export_folder'
+FOLDER_ACTIONS_ID = 'quanzhou_export_folder_actions'
+BROWSE_FOLDER = '选择文件夹…'
+RESET_FOLDER = '恢复默认位置'
 FILTERS = ('Occurrences', 'RootComponents', 'SolidBodies', 'SolidFaces')
 
 _app = None
@@ -43,6 +48,7 @@ class _ExportRequest:
     solid: object
     name: str
     auto_confirm: bool
+    folder: Path
     token: str = field(default_factory=lambda: uuid4().hex)
     done: Event = field(default_factory=Event)
 
@@ -107,17 +113,51 @@ def _resolve_part(entity):
     return native_body, name
 
 
-def _export_path(name):
+def _data_folder():
+    app_data = Path(os.environ.get('LOCALAPPDATA') or Path.home())
+    return app_data / 'FusionQuanzhouQuote'
+
+
+def _default_export_folder():
+    return _data_folder() / 'exports'
+
+
+def _load_export_folder():
+    try:
+        settings = json.loads((_data_folder() / 'settings.json').read_text(encoding='utf-8'))
+        value = settings.get('export_folder') if isinstance(settings, dict) else None
+        if isinstance(value, str) and '\x00' not in value:
+            folder = Path(value)
+            if folder.is_absolute():
+                return folder
+    except (OSError, ValueError):
+        pass
+    return _default_export_folder()
+
+
+def _save_export_folder(folder):
+    directory = _data_folder()
+    directory.mkdir(parents=True, exist_ok=True)
+    temporary = directory / f'.settings-{uuid4().hex}.tmp'
+    try:
+        temporary.write_text(json.dumps({'export_folder': str(folder)}, ensure_ascii=False) + '\n', encoding='utf-8')
+        temporary.replace(directory / 'settings.json')
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _export_path(name, folder):
     stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', name).strip(' .')[:90].rstrip(' .')
     if not stem:
         stem = 'Part'
     if re.fullmatch(r'CON|PRN|AUX|NUL|COM[0-9¹²³]|LPT[0-9¹²³]', stem.split('.')[0], re.I):
         stem = '_' + stem
-    app_data = Path(os.environ.get('LOCALAPPDATA') or Path.home())
-    exports = app_data / 'FusionQuanzhouQuote' / 'exports'
-    exports.mkdir(parents=True, exist_ok=True)
     prefix = datetime.now().strftime('%Y%m%d-%H%M%S-')
-    return Path(mkdtemp(prefix=prefix, dir=exports)) / (stem + '.step')
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        return Path(mkdtemp(prefix=prefix, dir=folder)) / (stem + '.step')
+    except OSError as error:
+        raise OSError(f'无法在当前保存位置创建 STEP 导出文件夹。请在报价窗口选择其他文件夹。\n{folder}\n{error}') from error
 
 
 def _write_step(design, output, component=None):
@@ -186,7 +226,7 @@ def _open_quote(output, auto_confirm):
 def _export_file(request, component=None):
     if not request.solid.isValid:
         raise QuoteError('原实体已不可用，请重新选择。')
-    output = _export_path(request.name)
+    output = _export_path(request.name, request.folder)
     try:
         if component is None:
             _export_solid(request.solid, output)
@@ -250,10 +290,11 @@ class _RunExport(adsk.core.CustomEventHandler):
 
 
 class _Execute(adsk.core.CommandEventHandler):
-    def __init__(self, selection, confirmation):
+    def __init__(self, selection, confirmation, folder):
         super().__init__()
         self.selection = selection
         self.confirmation = confirmation
+        self.folder = folder
 
     def notify(self, args):
         global _pending_export
@@ -263,7 +304,7 @@ class _Execute(adsk.core.CommandEventHandler):
             if _pending_export is not None and not _pending_export.done.is_set():
                 raise QuoteError('上一个零件正在导出，请稍后再试。')
             solid, name = _resolve_part(self.selection.selection(0).entity)
-            request = _ExportRequest(solid, name, self.confirmation.value)
+            request = _ExportRequest(solid, name, self.confirmation.value, Path(self.folder.value))
             component = _direct_component(solid)
             if component is not None:
                 try:
@@ -298,6 +339,41 @@ class _Prefill(adsk.core.CommandEventHandler):
             self.selection.addSelection(entity)
 
 
+class _FolderActions(adsk.core.InputChangedEventHandler):
+    def __init__(self, actions, folder):
+        super().__init__()
+        self.actions = actions
+        self.folder = folder
+
+    def notify(self, args):
+        if args.input.id != FOLDER_ACTIONS_ID:
+            return
+        try:
+            item = self.actions.selectedItem
+            if not item or item.name not in (BROWSE_FOLDER, RESET_FOLDER):
+                return
+            choose_folder = item.name == BROWSE_FOLDER
+            self.actions.listItems.item(0).isSelected = True
+            if choose_folder:
+                dialog = _ui.createFolderDialog()
+                dialog.title = '选择 STEP 保存文件夹'
+                current = Path(self.folder.value)
+                if current.is_dir():
+                    dialog.initialDirectory = str(current)
+                if dialog.showDialog() != adsk.core.DialogResults.DialogOK:
+                    return
+                folder = Path(dialog.folder)
+                if not folder.is_absolute() or not folder.is_dir():
+                    raise QuoteError('请选择一个可用的文件夹。')
+            else:
+                folder = _default_export_folder()
+            _save_export_folder(folder)
+            self.folder.value = str(folder)
+            self.folder.tooltip = self.folder.value
+        except Exception as error:
+            _ui.messageBox(_describe_error(error), TITLE)
+
+
 class _Release(adsk.core.CommandEventHandler):
     def __init__(self, handlers):
         super().__init__()
@@ -328,16 +404,27 @@ class _CreateCommand(adsk.core.CommandCreatedEventHandler):
             selection.setSelectionLimits(1, 1)
             confirmation = inputs.addBoolValueInput(AUTO_ID, '自动确认 6061 报价', True, '', True)
             confirmation.tooltip = '使用官网默认的铝合金 6061。取消勾选可在官网先选材质。'
+            folder = inputs.addStringValueInput(FOLDER_ID, 'STEP 保存位置', str(_load_export_folder()))
+            folder.isReadOnly = True
+            folder.tooltip = folder.value
+            actions = inputs.addDropDownCommandInput(
+                FOLDER_ACTIONS_ID, '更改位置', adsk.core.DropDownStyles.TextListDropDownStyle
+            )
+            actions.listItems.add('目录选项', True)
+            actions.listItems.add(BROWSE_FOLDER, False)
+            actions.listItems.add(RESET_FOLDER, False)
             note = inputs.addTextBoxCommandInput(
                 'quanzhou_help', '', '独立零件会自动选中唯一实体。装配中请选择要报价的那一件。', 2, True
             )
             note.isFullWidth = True
-            handlers = []
+            folder_actions = _FolderActions(actions, folder)
+            command.inputChanged.add(folder_actions)
+            handlers = [folder_actions]
             if entity and any(_selection_types(entity)):
                 prefill = _Prefill(selection, entity)
                 command.activate.add(prefill)
                 handlers.append(prefill)
-            execute = _Execute(selection, confirmation)
+            execute = _Execute(selection, confirmation, folder)
             release = _Release(handlers)
             command.execute.add(execute)
             command.destroy.add(release)
